@@ -1,0 +1,21 @@
+export default {
+ async fetch(request,env){const url=new URL(request.url);if(url.pathname==='/health')return Response.json({ok:true,game:'Three-Point Rush',version:'0.5'});if(url.pathname!=='/ws'||request.headers.get('Upgrade')?.toLowerCase()!=='websocket')return new Response('Three-Point Rush multiplayer server. GET /health', {status:400});
+ const mode=url.searchParams.get('mode'),name=(url.searchParams.get('name')||'PLAYER').replace(/[<>]/g,'').trim().slice(0,16)||'PLAYER';let room=(url.searchParams.get('room')||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6);
+ if(mode==='create'){room=crypto.randomUUID().replaceAll('-','').slice(0,6).toUpperCase()}else if(mode!=='join'||room.length<4)return new Response('Invalid room code',{status:400});
+ const id=env.ROOMS.idFromName(room);return env.ROOMS.get(id).fetch(new Request('https://room.internal/ws?'+new URLSearchParams({mode,room,name}),request));
+ }
+};
+export class GameRoom {
+ constructor(state,env){this.state=state;this.env=env;this.clients=new Map();this.phase='lobby';this.host=null;this.endAt=0;this.room='';}
+ async fetch(request){if(request.headers.get('Upgrade')?.toLowerCase()!=='websocket')return new Response('WebSocket required',{status:426});const url=new URL(request.url);const mode=url.searchParams.get('mode');const room=url.searchParams.get('room');const name=url.searchParams.get('name');if(this.phase!=='lobby')return new Response('Match already running',{status:409});if(mode==='join'&&!this.room)return new Response('Room not found or expired',{status:404});if(this.clients.size>=4)return new Response('Room full',{status:409});if(!this.room)this.room=room;
+ const pair=new WebSocketPair();const [client,server]=Object.values(pair);server.accept();const id=crypto.randomUUID();const p={id,name,score:0,ready:false,connected:true,lastScoreAt:0,lastShot:0,socket:server};this.clients.set(id,p);if(!this.host)this.host=id;this.send(server,{type:'welcome',id,room:this.room,host:id===this.host});this.broadcast();server.addEventListener('message',ev=>{try{this.message(p,JSON.parse(ev.data))}catch{this.send(server,{type:'error',message:'Invalid message'})}});server.addEventListener('close',()=>this.disconnect(p));server.addEventListener('error',()=>this.disconnect(p));return new Response(null,{status:101,webSocket:client})}
+ send(ws,msg){try{ws.send(JSON.stringify(msg))}catch{}}
+ snapshot(){return {type:'state',phase:this.phase,room:this.room,host:this.host,serverTime:Date.now(),endAt:this.endAt,players:[...this.clients.values()].map(({id,name,score,ready,connected})=>({id,name,score,ready,connected}))}}
+ broadcast(msg=this.snapshot()){for(const p of this.clients.values())if(p.connected)this.send(p.socket,msg)}
+ message(p,m){if(!p.connected||!m||typeof m.type!=='string')return;const now=Date.now();if(m.type==='ready'&&this.phase==='lobby'){p.ready=!p.ready;this.broadcast()}
+ else if(m.type==='start'&&this.phase==='lobby'&&p.id===this.host){const active=[...this.clients.values()].filter(x=>x.connected);if(active.length<2||!active.every(x=>x.ready)){this.send(p.socket,{type:'error',message:'Need 2–4 ready players.'});return}this.phase='playing';this.endAt=now+60000;for(const x of active){x.score=0;x.lastScoreAt=0;x.lastShot=0}this.broadcast({type:'start',endAt:this.endAt,serverTime:now});this.broadcast();this.state.storage.setAlarm(this.endAt)}
+ else if(m.type==='score'&&this.phase==='playing'&&now<this.endAt&&now>=this.endAt-60000){const shot=Number(m.shot);if(Number.isSafeInteger(shot)&&shot>p.lastShot&&shot<1000&&now-p.lastScoreAt>=450){p.lastShot=shot;p.lastScoreAt=now;p.score+=3;this.broadcast()}}
+ else if(m.type==='rematch'&&this.phase==='finished'){this.phase='lobby';this.endAt=0;for(const x of this.clients.values()){x.score=0;x.ready=false;x.lastShot=0}this.broadcast({type:'reset'});this.broadcast()}}
+ async alarm(){if(this.phase==='playing'){this.phase='finished';this.broadcast({type:'finish',players:this.snapshot().players,serverTime:Date.now()});this.broadcast()}}
+ disconnect(p){if(!p.connected)return;p.connected=false;if(this.phase==='lobby'){this.clients.delete(p.id);if(this.host===p.id)this.host=this.clients.keys().next().value||null;if(this.clients.size===0)this.room=''}this.broadcast()}
+}
